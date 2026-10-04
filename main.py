@@ -1,6 +1,8 @@
 import json
+import random
 import re
 import sys
+import time
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -17,6 +19,10 @@ from observability import Timer, estimate_cost, estimate_tokens, log_call
 # Sampling settings, recorded under Inputs in SPEC.md.
 TEMPERATURE = 0.7
 MAX_TOKENS = 2000
+
+# Retry policy, from SPEC.md.
+MAX_ERROR_ATTEMPTS = 3   # error: 3 attempts in total
+MAX_DELAY_SECONDS = 8    # no wait is ever longer than this
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +166,15 @@ Requirements:
 """.strip()
 
 
+def build_repair_prompt(topic: str) -> str:
+    # Used for the one repair retry after an invalid_output reply.
+    return (
+        build_prompt(topic)
+        + "\n\nYour previous reply could not be used: it was not valid JSON "
+        "in the structure above. Reply again with only the JSON object."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reply classification
 # ---------------------------------------------------------------------------
@@ -221,11 +236,29 @@ def read_usage(response, prompt, content):
     return prompt_tokens, completion_tokens, False
 
 
+def get_retry_after(exc):
+    """Seconds the provider asked us to wait, or None if it did not say.
+
+    Looks for a retry_after attribute (the stub's rate-limit error), then
+    for a Retry-After header on the error's HTTP response (the OpenAI SDK).
+    """
+    value = getattr(exc, "retry_after", None)
+    if value is None:
+        headers = getattr(getattr(exc, "response", None), "headers", None)
+        if headers is not None:
+            value = headers.get("retry-after")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def call_model(client, model, prompt, attempt):
     """Make one model call: time it, classify the result, write one log line.
 
-    Returns (status, validated). Every call writes exactly one line to
-    run_log.jsonl, whatever the status.
+    Returns (status, validated, retry_after). retry_after is only set when
+    the call failed and the provider said how long to wait. Every call
+    writes exactly one line to run_log.jsonl, whatever the status.
     """
     try:
         with Timer() as timer:
@@ -244,7 +277,7 @@ def call_model(client, model, prompt, attempt):
         print(f"Model call failed: {exc}", file=sys.stderr)
         # The call never completed, so tokens and cost are unknown: null.
         log_call("error", model, None, None, timer.ms, None, attempt=attempt)
-        return "error", None
+        return "error", None, get_retry_after(exc)
 
     try:
         content = response.choices[0].message.content
@@ -267,7 +300,61 @@ def call_model(client, model, prompt, attempt):
         tokens_estimated=estimated,
         attempt=attempt,
     )
-    return status, validated
+    return status, validated, None
+
+
+# ---------------------------------------------------------------------------
+# Retry policy
+# ---------------------------------------------------------------------------
+
+def backoff_delay(next_attempt, retry_after):
+    """Seconds to wait before attempt number next_attempt.
+
+    (2 ** n) plus up to 1 second of jitter. If the provider's Retry-After is
+    longer, wait that instead. Never more than MAX_DELAY_SECONDS.
+    """
+    delay = (2 ** next_attempt) + random.uniform(0, 1)
+    if retry_after is not None and retry_after > delay:
+        delay = retry_after
+    return min(delay, MAX_DELAY_SECONDS)
+
+
+def run_with_retries(client, model, topic):
+    """Call the model under the retry policy. Returns (status, validated).
+
+    - ok: stop.
+    - refused: never retried.
+    - invalid_output: one repair retry, which is not itself retried.
+    - error: up to MAX_ERROR_ATTEMPTS attempts in total, with backoff. An
+      error on the repair retry ends the run.
+    """
+    prompt = build_prompt(topic)
+    attempt = 0
+    errors = 0
+    repaired = False
+
+    while True:
+        attempt += 1
+        status, validated, retry_after = call_model(client, model, prompt, attempt)
+
+        if status in ("ok", "refused"):
+            return status, validated
+
+        if status == "invalid_output":
+            if repaired:
+                return status, None
+            repaired = True
+            prompt = build_repair_prompt(topic)
+            print("Reply unusable, making one repair retry", file=sys.stderr)
+            continue
+
+        # status == "error"
+        errors += 1
+        if repaired or errors >= MAX_ERROR_ATTEMPTS:
+            return status, None
+        delay = backoff_delay(attempt + 1, retry_after)
+        print(f"Retrying in {delay:.1f}s", file=sys.stderr)
+        time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +372,6 @@ def main() -> int:
     if not validate_topic(topic):
         return 2
 
-    prompt = build_prompt(topic)
-
     try:
         client = get_client()
         model = get_model()
@@ -295,7 +380,7 @@ def main() -> int:
         print("error")
         return 1
 
-    status, validated = call_model(client, model, prompt, attempt=1)
+    status, validated = run_with_retries(client, model, topic)
 
     if status != "ok":
         print(status)
