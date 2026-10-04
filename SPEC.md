@@ -1,76 +1,112 @@
 # What it does
 
-<!-- One paragraph. Someone outside this course should understand it. -->
-The application accepts a topic from the command line input and asks a language model to generate five multiple-choice questions about that topic. Each question contains the question text, exactly four answer options, the index of the correct option, and a difficulty level. The application extracts JSON from the model response even when the response contains a Markdown code fence or a short preamble, parses the JSON, validates it with Pydantic, and reports whether the response was accepted, unusable, refused, or failed.
+The application accepts a topic from the command line and asks a language model (Groq, `openai/gpt-oss-20b`) to generate five multiple-choice questions about it. Each question has the question text, exactly four answer options, the index of the correct option, and a difficulty level. The application extracts JSON from the reply even when it is wrapped in a Markdown code fence or preceded by a short preamble, validates it with Pydantic, and reports whether the reply was accepted (`ok`), unusable (`invalid_output`), declined (`refused`), or the call failed (`error`).
+
+Every model call is also recorded in `run_log.jsonl` (status, tokens, latency, cost). Failed calls are retried under a capped policy. `REPORT.md` answers the client's question about cost and speed using numbers from that log.
 
 # Inputs
 
-<!-- Every input. Type, constraints, and what happens if it is absent. -->
-The application takes one required command-line input: topic.
-
-topic is a string between 5 and 50 characters after removing leading and trailing whitespace(if any). A topic containing only whitespace, an absent topic, or a topic outside this length range is rejected before any model call and exits with code 2.
-
-The model configuration is read from .env through client.py using LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL.
+- `topic`: required first command-line argument, a string of 3 to 200 characters after stripping leading and trailing whitespace. An absent, empty, whitespace-only or out-of-range topic is rejected before any model call: exit code 2, no model call, no log line.
+- `.env`, read through `client.py`: `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`. Real runs use Groq at `https://api.groq.com/openai/v1` with `openai/gpt-oss-20b`. The key is never logged, printed or committed.
+- `PRICE_IN_PER_MTOK = 0.075` USD per 1,000,000 input tokens.
+- `PRICE_OUT_PER_MTOK = 0.30` USD per 1,000,000 output tokens.
+  Source for both: Groq's published price list for `openai/gpt-oss-20b`. Groq's free tier does not charge, so these are the equivalent paid prices and every cost in `REPORT.md` is an equivalent cost, not money spent.
+- `temperature = 0.7`: the client needs question papers that do not repeat, so some variety is wanted. Shape is protected by validation and the repair retry, not by low temperature.
+- `max_tokens = 2000`: five questions need well under this, and the headroom covers the case where the model's reasoning tokens count toward the limit. To be revisited after real token counts appear in `run_log.jsonl`.
 
 # Outputs
 
-<!-- The exact shape. If it is JSON, the actual keys. -->
-A successful response contains the following JSON structure:
+**stdout.** On success, the generated questions as JSON. Diagnostics go to stderr. The last non-empty stdout line is exactly one of `ok`, `invalid_output`, `refused`, `error`.
 
-topic: string containing the requested topic.
+**Question JSON (the schema).**
 
-questions: a list containing exactly 5 question objects.
+- `topic`: string.
+- `questions`: list of exactly 5 objects, each with:
+  - `question`: string, 10 to 300 characters.
+  - `options`: list of exactly 4 strings, each 1 to 100 characters.
+  - `answer_index`: integer 0 to 3, pointing at an existing option.
+  - `difficulty`: one of `easy`, `medium`, `hard`.
 
-Each question object contains:
+**`run_log.jsonl`** in the repository root: one JSON object per model call (a retry is its own line), append only, never committed. All lines from one run share one `run_id`. Fields:
 
-question: a string between 10 and 500 characters.
+| Field | Type | Value |
+| --- | --- | --- |
+| `timestamp` | string | ISO 8601, UTC |
+| `run_id` | string | shared by every call in one run |
+| `model` | string | the model actually used |
+| `status` | string | `ok`, `invalid_output`, `refused` or `error` |
+| `prompt_tokens` | int or null | measured; estimated if the provider reports none; null on `error` |
+| `completion_tokens` | int or null | same rule as `prompt_tokens` |
+| `latency_ms` | int | wall-clock time around the call |
+| `cost_usd` | float or null | computed from the two prices; null on `error` or when a token count is null |
+| `tokens_estimated` | bool | true only when the token counts are my estimate |
+| `attempt` | int (extra field) | 1 for the first call of a run, 2 for the next, and so on |
 
-options: a list containing exactly 4 answer strings, each between 1 and 50 characters.
+`cost_usd = (prompt_tokens * PRICE_IN_PER_MTOK + completion_tokens * PRICE_OUT_PER_MTOK) / 1,000,000`
 
-answer_index: an integer from 0 to 3 identifying the correct option in options.
+Unknown is `null`, never `0`. The log never contains a key, a full prompt or a full reply.
 
-difficulty: one of easy, medium, or hard.
-
-The program may print the generated questions or other useful information, but the last non-empty stdout line must be exactly ok, invalid_output, refused, or error.
-
+**`samples/run_log_sample.jsonl`**: at least 20 lines copied unedited from `run_log.jsonl`, at least 5 from the real provider. This file is committed instead of the log.
 
 # Failure cases
 
-<!-- What can go wrong, and what the program does about each one.
-     Each one must be something you can make happen on purpose. -->
-An invalid or missing topic is rejected before any model call and exits with code 2.
+| Case | How to make it happen | What the program does | Last line | Exit | Log lines |
+| --- | --- | --- | --- | --- | --- |
+| Bad topic | `python main.py ""`, or a 2-character topic | Rejected before any call | not constrained | 2 | 0 |
+| Unusable reply | `stub:malformed`, `stub:badshape`, `stub:empty` | Log the call as `invalid_output`, make exactly one repair retry; if that reply is also unusable, stop | `invalid_output` | 1 | 2 |
+| Repair retry succeeds | real provider only; no supplied stub mode produces it | First line `invalid_output`, second line `ok` | `ok` | 0 | 2 |
+| Refusal | `stub:refused` | Never retried | `refused` | 1 | 1 |
+| Call fails | `stub:error` | Up to 3 attempts in total with backoff; all fail | `error` | 1 | 3 |
+| Error, then recovery | `stub:flaky` | First line `error`, wait, second line `ok` | `ok` | 0 | 2 |
+| Rate limited | `stub:ratelimit` (carries a 1 second `retry_after`) | Up to 3 attempts in total, all `error` | `error` | 1 | 3 |
+| Provider reports no usage | a reply whose `usage` is missing or zeroed | Use `estimate_tokens()` and set `tokens_estimated=true` on that line; status, last line and exit code are unaffected | unchanged | unchanged | unchanged |
 
-A model response that is empty, malformed JSON, or valid JSON that fails the defined schema or validation rules is reported as invalid_output and exits with code 1.
+Retry rules:
 
-A response containing an explicit refusal to generate questions is reported as refused and exits with code 1.
-
-A model or client failure that prevents completion of the request is reported as error and exits with code 1.
-
-A valid response enclosed in a Markdown JSON code fence or preceded by a short explanatory preamble is accepted after JSON extraction and validation.
-
-The answer_index must point to an existing option, and each question must contain exactly four options.
+- Backoff delay before attempt `n` is `(2 ** n) + random.uniform(0, 1)` seconds, never above 8 seconds.
+- If the provider sends `Retry-After` and it is longer than the computed delay, wait that long instead, but never more than 8 seconds.
+- The repair retry is made once and is not itself retried. If it raises an error, the run ends with `error`.
+- Every error is retried the same way, including errors that cannot succeed on retry such as a 404 for an unknown model.
 
 # Acceptance checks
 
-<!-- How someone else proves it works, without asking you anything.
-     Each one a command they can run and a result they can see. -->
-python main.py <topic> with a working provider must produce a valid response and end with ok and exit code 0.
+Each check runs in PowerShell. Setting the three variables overrides `.env` for that terminal session only, so run `Remove-Item Env:LLM_API_KEY, Env:LLM_BASE_URL, Env:LLM_MODEL` afterwards, or open a new terminal, before using the real provider again. Checks assert on shape only: last line, exit code, number of new log lines, keys present. They never assert on question text.
 
-The application must accept the supplied valid sample response and reject the supplied invalid sample response.
+`stub:flaky` must end in `ok`, exit 0, with 2 new log lines, the first `error` and the second `ok`:
 
-The stub modes stub:ok, stub:fenced, and stub:preamble must end with ok and exit code 0.
+```powershell
+$env:LLM_API_KEY="not-needed"; $env:LLM_BASE_URL="local://stub"; $env:LLM_MODEL="stub:flaky"
+$n0 = if (Test-Path run_log.jsonl) { @(Get-Content run_log.jsonl).Count } else { 0 }
+python main.py "photosynthesis"; "exit: $LASTEXITCODE"
+"new log lines: $(@(Get-Content run_log.jsonl).Count - $n0)"
+Get-Content run_log.jsonl -Tail 2 | ForEach-Object { ($_ | ConvertFrom-Json).status }
+```
 
-The stub modes stub:malformed, stub:badshape, and stub:empty must end with invalid_output and exit code 1.
+`stub:ratelimit` must end in `error`, exit 1, with 3 new log lines, all with status `error`:
 
-The stub mode stub:refused must end with refused and exit code 1.
+```powershell
+$env:LLM_API_KEY="not-needed"; $env:LLM_BASE_URL="local://stub"; $env:LLM_MODEL="stub:ratelimit"
+$n0 = if (Test-Path run_log.jsonl) { @(Get-Content run_log.jsonl).Count } else { 0 }
+python main.py "photosynthesis"; "exit: $LASTEXITCODE"
+"new log lines: $(@(Get-Content run_log.jsonl).Count - $n0)"
+Get-Content run_log.jsonl -Tail 3 | ForEach-Object { ($_ | ConvertFrom-Json).status }
+```
 
-The stub mode stub:error must end with error and exit code 1.
+The same pattern, with only `LLM_MODEL` changed, applies to the remaining modes:
 
-An empty topic must exit with code 2 without making a model call.
+| `LLM_MODEL` | Last line | Exit | New log lines |
+| --- | --- | --- | --- |
+| `stub:ok`, `stub:fenced`, `stub:preamble` | `ok` | 0 | 1 |
+| `stub:malformed`, `stub:badshape`, `stub:empty` | `invalid_output` | 1 | 2 |
+| `stub:refused` | `refused` | 1 | 1 |
+| `stub:error` | `error` | 1 | 3 |
 
-The complete implementation must pass python check.py ..
+An empty topic (`python main.py ""`) must exit 2, call no model, and add no log line.
+
+After any run, every line of `run_log.jsonl` must parse as JSON and contain the nine required keys, and all lines from one run must share one `run_id`.
+
+The complete implementation must pass `python check.py .`.
 
 # Out of scope
 
-<!-- What you are deliberately not building. -->
-The application does not provide a web or graphical interface, store questions in a database, authenticate users, maintain question history across executions, or guarantee that questions are unique across separate runs.
+The application does not provide a web or graphical interface, store questions in a database, authenticate users, keep question history across runs, or guarantee that questions are unique across separate runs. It does not look up prices automatically, rotate or aggregate the log, retry refusals, or call any model other than through `client.py`.

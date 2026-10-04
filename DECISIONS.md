@@ -25,3 +25,14 @@ I chose to implement an `extract_json` function that extracts the JSON object fr
 ## 2026-09-20 - Refusal detection
 
 I chose to detect explicit refusal language before attempting JSON parsing. I considered treating every unparseable prose response as `invalid_output`, but rejected that approach because the application contract distinguishes a model refusal from other unusable responses. The application therefore checks for explicit refusal phrases and reports `refused` when they are detected. The trade-off is that phrase-based detection may produce a false positive if a legitimate response contains one of the selected refusal phrases.
+
+
+
+## 2026-10-04 - Model: gpt-oss-20b instead of llama-3.1-8b-instant
+
+I first set LLM_MODEL=llama-3.1-8b-instant, because it is a plain instruct model and a good fit for five short questions. My first real call returned a 404 model_not_found ("does not exist or you do not have access to it"). I switched to openai/gpt-oss-20b; two real runs ("laptop" and "photosynthesis") both returned five valid questions and ok. I considered openai/gpt-oss-120b, which costs twice as much per token for a task. The cost of my choice is that gpt-oss is a reasoning model, so hidden reasoning tokens may add cost and latency. I will measure that in run_log.jsonl instead of assuming it.
+
+
+## 2026-10-04 - All errors are retried the same way
+
+I chose to retry every error up to 3 attempts in total, without trying to tell temporary failures such as a 429 from permanent ones such as the 404 I hit on llama-3.1-8b-instant. I considered not retrying permanent failures, but rejected that, because stub:error raises a generic exception that carries no signal to classify, and the lab's check expects 2 or 3 log lines for it. The cost is that a permanent error wastes about three attempts and a few seconds of backoff before it is reported.
