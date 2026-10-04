@@ -36,3 +36,23 @@ I first set LLM_MODEL=llama-3.1-8b-instant, because it is a plain instruct model
 ## 2026-10-04 - All errors are retried the same way
 
 I chose to retry every error up to 3 attempts in total, without trying to tell temporary failures such as a 429 from permanent ones such as the 404 I hit on llama-3.1-8b-instant. I considered not retrying permanent failures, but rejected that, because stub:error raises a generic exception that carries no signal to classify, and the lab's check expects 2 or 3 log lines for it. The cost is that a permanent error wastes about three attempts and a few seconds of backoff before it is reported.
+
+## 2026-10-04 - Repair retry re-asks with the original prompt plus one sentence
+
+For the one repair retry after an `invalid_output` reply, I send the original prompt with one added sentence saying the previous reply could not be used and to reply again with only the JSON object. I considered sending the unusable reply back to the model and asking it to fix that text, but rejected it because it adds input tokens to every repair, and a reply that was cut off at `max_tokens` has little worth repairing. I also considered repeating the identical prompt, but rejected it because the retry then gives the model no hint that anything went wrong. The cost is that the model does not see what was wrong with its first reply.
+
+## 2026-10-04 - Backoff exponent is the number of the attempt about to be made
+
+SPEC.md says the delay before attempt `n` is `(2 ** n) + random.uniform(0, 1)`. I read `n` as the attempt about to be made, so the wait before attempt 2 is 4 to 5 seconds and before attempt 3 is 8 seconds (capped). I considered using the number of the attempt that just failed, which gives 2 to 3 seconds and then 4 to 5 seconds, and rejected it because it does not match "before attempt n" in the spec. The cost is that a call that always fails takes about 13 seconds before the program gives up, which is still well inside `check.py`'s 60 second limit.
+
+## 2026-10-04 - Latency is timed around the model call only
+
+I wrap only `client.chat.completions.create(...)` in `Timer`, so `latency_ms` excludes JSON parsing, validation and the backoff sleep between attempts. I considered timing the whole run or each attempt including its parsing, but rejected that because the client's question about slowness is about the model, and the log line is per call. Parsing takes microseconds and a sleep is my own policy, so including either would blur what the model costs in time. The cost is that the log does not show how long a user actually waits across retries; I add the lines of one `run_id` together for that.
+
+## 2026-10-04 - Missing, partial or zeroed usage is treated as unknown and estimated
+
+`read_usage` uses the provider's token counts only when both are present and not both zero. If `usage` is missing, either count is `None`, or both are 0, I estimate both counts with `estimate_tokens()` and set `tokens_estimated=true`. I considered trusting zeros as measurements, but rejected it because a provider reporting zero tokens for a call that returned text is wrong, and a cost of 0.0 would then be reported as fact. I also considered estimating only the missing count, but rejected it because mixing a measured and an estimated count on one line would make `tokens_estimated` ambiguous. The cost is that an honest zero completion count is estimated instead; that is rare for this app.
+
+## 2026-10-04 - Keep stub runs out of the log that feeds REPORT.md
+
+I tested retries with the stubs by setting `RUN_LOG_PATH` to a temporary file, and made 25 runs against the real provider to build `run_log.jsonl` and `samples/run_log_sample.jsonl`. I considered running stub modes into the real log to reach 20 lines quickly or to show `error` retries, but rejected it because stub calls take about a millisecond and cost fake tokens, which would pull the median latency and cost per paper in `REPORT.md` away from what the real model does. The cost is that the committed sample contains no `error` line; the retry behaviour is shown by the stub checks in SPEC.md instead.
