@@ -1,0 +1,3 @@
+# Question
+
+I found `stub:badshape` the hardest outcome to handle because the response is valid JSON, but its structure violates the application's schema. Unlike `stub:malformed`, which fails during JSON parsing, `stub:badshape` reaches Pydantic validation before being rejected. Running `stub:ok`, `stub:fenced`, `stub:preamble`, `stub:malformed`, `stub:badshape`, `stub:empty`, `stub:refused`, and `stub:error` showed that different failures occur at different stages of the processing pipeline. This tells me that validation cannot depend only on checking whether the response is valid JSON; it must also verify the required fields, constraints, and relationships between fields such as `answer_index` and `options`.
