@@ -47,8 +47,8 @@ from datetime import datetime, timezone
 # client's question with a number you did not work for.
 # --------------------------------------------------------------------------
 
-PRICE_IN_PER_MTOK = 0.0     # input / prompt tokens
-PRICE_OUT_PER_MTOK = 0.0    # output / completion tokens
+PRICE_IN_PER_MTOK = 0.075   # input / prompt tokens
+PRICE_OUT_PER_MTOK = 0.30   # output / completion tokens
 
 LOG_PATH = os.getenv("RUN_LOG_PATH", "run_log.jsonl")
 

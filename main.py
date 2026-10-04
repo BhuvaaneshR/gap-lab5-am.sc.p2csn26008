@@ -1,20 +1,35 @@
 import json
 import re
 import sys
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from client import get_client, get_model
+from observability import Timer, estimate_cost, estimate_tokens, log_call
+
+# Sampling settings, recorded under Inputs in SPEC.md.
+TEMPERATURE = 0.7
+MAX_TOKENS = 2000
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+# Each option must be 1 to 100 characters, as the prompt and SPEC.md promise.
+Option = Annotated[str, StringConstraints(min_length=1, max_length=100)]
+
+
 class Question(BaseModel):
     question: str = Field(min_length=10, max_length=300)
-    options: list[str] = Field(min_length=4, max_length=4)
+    options: list[Option] = Field(min_length=4, max_length=4)
     answer_index: int = Field(ge=0, le=3)
     difficulty: Literal["easy", "medium", "hard"]
 
@@ -146,6 +161,116 @@ Requirements:
 
 
 # ---------------------------------------------------------------------------
+# Reply classification
+# ---------------------------------------------------------------------------
+
+def classify_reply(content):
+    """Turn the model's text into (status, validated).
+
+    status is ok, invalid_output or refused. validated is the parsed
+    GeneratedResponse when status is ok, otherwise None.
+    """
+    if not content or not content.strip():
+        print("Model returned an empty response", file=sys.stderr)
+        return "invalid_output", None
+
+    if is_refusal(content):
+        return "refused", None
+
+    try:
+        json_text = extract_json(content)
+    except ValueError as exc:
+        print(f"JSON extraction failed: {exc}", file=sys.stderr)
+        return "invalid_output", None
+
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        print(f"Invalid JSON: {exc}", file=sys.stderr)
+        return "invalid_output", None
+
+    try:
+        validated = GeneratedResponse.model_validate(data)
+    except ValidationError as exc:
+        print(f"Validation failed: {exc}", file=sys.stderr)
+        return "invalid_output", None
+
+    return "ok", validated
+
+
+# ---------------------------------------------------------------------------
+# One logged model call
+# ---------------------------------------------------------------------------
+
+def read_usage(response, prompt, content):
+    """Return (prompt_tokens, completion_tokens, tokens_estimated).
+
+    Uses the provider's counts when it reports them. When usage is missing,
+    has a None count, or is zeroed, both counts are estimated instead.
+    """
+    usage = getattr(response, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+
+    missing = prompt_tokens is None or completion_tokens is None
+    zeroed = prompt_tokens == 0 and completion_tokens == 0
+
+    if missing or zeroed:
+        return estimate_tokens(prompt), estimate_tokens(content or ""), True
+
+    return prompt_tokens, completion_tokens, False
+
+
+def call_model(client, model, prompt, attempt):
+    """Make one model call: time it, classify the result, write one log line.
+
+    Returns (status, validated). Every call writes exactly one line to
+    run_log.jsonl, whatever the status.
+    """
+    try:
+        with Timer() as timer:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+            )
+    except Exception as exc:
+        print(f"Model call failed: {exc}", file=sys.stderr)
+        # The call never completed, so tokens and cost are unknown: null.
+        log_call("error", model, None, None, timer.ms, None, attempt=attempt)
+        return "error", None
+
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError):
+        print("Model response did not contain message content", file=sys.stderr)
+        content = None
+
+    status, validated = classify_reply(content)
+    prompt_tokens, completion_tokens, estimated = read_usage(
+        response, prompt, content
+    )
+
+    log_call(
+        status,
+        getattr(response, "model", None) or model,
+        prompt_tokens,
+        completion_tokens,
+        timer.ms,
+        estimate_cost(prompt_tokens, completion_tokens),
+        tokens_estimated=estimated,
+        attempt=attempt,
+    )
+    return status, validated
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -162,83 +287,20 @@ def main() -> int:
 
     prompt = build_prompt(topic)
 
-    # ---------------------------------------------------------------
-    # One model call through the supplied client.py
-    # ---------------------------------------------------------------
     try:
         client = get_client()
         model = get_model()
-
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-        )
-
     except Exception as exc:
-        print(f"Model call failed: {exc}", file=sys.stderr)
+        print(f"Could not create the model client: {exc}", file=sys.stderr)
         print("error")
         return 1
 
-    # ---------------------------------------------------------------
-    # Obtain the model's text response
-    # ---------------------------------------------------------------
-    try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError, TypeError):
-        print("Model response did not contain message content", file=sys.stderr)
-        print("invalid_output")
+    status, validated = call_model(client, model, prompt, attempt=1)
+
+    if status != "ok":
+        print(status)
         return 1
 
-    if not content or not content.strip():
-        print("Model returned an empty response", file=sys.stderr)
-        print("invalid_output")
-        return 1
-
-    # ---------------------------------------------------------------
-    # Refusal detection
-    # ---------------------------------------------------------------
-    if is_refusal(content):
-        print("refused")
-        return 1
-
-    # ---------------------------------------------------------------
-    # Extract JSON
-    # ---------------------------------------------------------------
-    try:
-        json_text = extract_json(content)
-    except ValueError as exc:
-        print(f"JSON extraction failed: {exc}", file=sys.stderr)
-        print("invalid_output")
-        return 1
-
-    # ---------------------------------------------------------------
-    # Parse JSON
-    # ---------------------------------------------------------------
-    try:
-        data = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        print(f"Invalid JSON: {exc}", file=sys.stderr)
-        print("invalid_output")
-        return 1
-
-    # ---------------------------------------------------------------
-    # Pydantic validation
-    # ---------------------------------------------------------------
-    try:
-        validated = GeneratedResponse.model_validate(data)
-    except ValidationError as exc:
-        print(f"Validation failed: {exc}", file=sys.stderr)
-        print("invalid_output")
-        return 1
-
-    # ---------------------------------------------------------------
-    # Successful result
-    # ---------------------------------------------------------------
     print(json.dumps(validated.model_dump(), indent=2))
     print("ok")
     return 0
